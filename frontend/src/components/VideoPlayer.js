@@ -52,9 +52,40 @@ const VideoPlayer = () => {
   const requestInProgressRef = useRef(false);
   const videoUrlRef = useRef(null);
 
+  // 存储事件监听器引用
+  const eventListenersRef = useRef({});
+
+  // 停止视频流
+  const stopVideoStream = useCallback(() => {
+    try {
+      console.log('Stopping video stream...');
+      // 使用 fetch 但不等待响应，避免阻塞
+      fetch(`${config.API_BASE_URL}/api/video/stop`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({})
+      }).then(response => {
+        if (response.ok) {
+          console.log('Video stream stopped successfully');
+        } else {
+          console.warn('Failed to stop video stream:', response.status);
+        }
+      }).catch(error => {
+        console.warn('Error stopping video stream:', error);
+      });
+    } catch (error) {
+      console.warn('Error stopping video stream:', error);
+    }
+  }, []);
+
   // 清理函数
   const cleanup = useCallback(() => {
     console.log('Cleaning up resources...');
+    
+    // 停止后端流
+    stopVideoStream();
     
     if (abortControllerRef.current) {
       console.log('Aborting previous request...');
@@ -64,39 +95,100 @@ const VideoPlayer = () => {
     
     if (videoRef.current) {
       console.log('Cleaning up video element...');
+      // 暂停视频
       videoRef.current.pause();
+      
+      // 移除所有事件监听器
+      Object.entries(eventListenersRef.current).forEach(([event, handler]) => {
+        if (handler) {
+          videoRef.current.removeEventListener(event, handler);
+        }
+      });
+      eventListenersRef.current = {};
+      
+      // 清空视频源
       videoRef.current.removeAttribute('src');
+      videoRef.current.srcObject = null;
+      
+      // 强制重新加载以释放资源
       videoRef.current.load();
     }
     
+    // 清理 URL 引用
     if (videoUrlRef.current) {
-      console.log('Revoking blob URL...');
-      URL.revokeObjectURL(videoUrlRef.current);
+      if (videoUrlRef.current.startsWith('blob:')) {
+        console.log('Revoking blob URL...');
+        URL.revokeObjectURL(videoUrlRef.current);
+      } else {
+        console.log('Clearing stream URL...');
+      }
       videoUrlRef.current = null;
     }
     
     setVideoUrl(null);
     setLoading(false);
     setError(null);
+    setIsPlaying(false);
     requestInProgressRef.current = false;
-  }, []);
+  }, [stopVideoStream]);
 
   // 组件卸载时清理
   useEffect(() => {
     isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
+    
+    // 页面卸载时的清理
+    const handleBeforeUnload = () => {
+      console.log('Page unloading, cleaning up...');
       cleanup();
     };
-  }, [cleanup]);
+    
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        console.log('Page hidden, pausing video...');
+        // 页面隐藏时暂停视频并清理流
+        if (videoRef.current && !videoRef.current.paused) {
+          videoRef.current.pause();
+          setIsPlaying(false);
+        }
+        // 页面隐藏时也清理流
+        stopVideoStream();
+      }
+    };
+    
+    // 监听路由变化（如果使用 React Router）
+    const handlePopState = () => {
+      console.log('Route changing, cleaning up...');
+      cleanup();
+    };
+    
+    // 监听页面焦点变化
+    const handleBlur = () => {
+      console.log('Window lost focus, cleaning up...');
+      cleanup();
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('unload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('popstate', handlePopState);
+    window.addEventListener('blur', handleBlur);
+    
+    return () => {
+      console.log('VideoPlayer component unmounting...');
+      isMountedRef.current = false;
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('unload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('popstate', handlePopState);
+      window.removeEventListener('blur', handleBlur);
+      cleanup();
+    };
+  }, [cleanup, stopVideoStream]);
 
   // 加载视频
   const loadVideo = useCallback(async (url) => {
-    if (!isMountedRef.current) {
-      console.log('Component is unmounted, skipping video load');
-      return;
-    }
-
     if (requestInProgressRef.current) {
       console.log('Request already in progress, aborting previous request');
       cleanup();
@@ -108,110 +200,124 @@ const VideoPlayer = () => {
     setError(null);
 
     try {
-      // 创建新的 AbortController
-      abortControllerRef.current = new AbortController();
-      
-      const response = await fetch(url, {
-        signal: abortControllerRef.current.signal,
-        headers: {
-          'Range': 'bytes=0-',
-          'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8'
-        }
-      });
-
-      if (!isMountedRef.current) {
-        console.log('Component unmounted during fetch');
-        return;
-      }
-
-      if (!response.ok) {
-        let errorMessage = '加载视频失败';
-        try {
-          const data = await response.json();
-          errorMessage = data.message || errorMessage;
-        } catch (e) {
-          // 如果响应不是 JSON，使用默认错误消息
-        }
-        throw new Error(errorMessage);
-      }
-
-      // 直接获取视频数据
-      const blob = await response.blob();
-      console.log('Received video blob:', blob.size, 'bytes, type:', blob.type);
-      
-      // 检查 blob 大小
-      if (blob.size < 10000) {  // 小于10KB可能是错误
-        console.warn('Video blob size is very small, might be an error response');
-        const text = await blob.text();
-        console.log('Blob content:', text);
-        
-        if (text.includes('error') || text.includes('Error')) {
-          throw new Error('服务器返回错误：' + text);
-        }
-      }
-
-      if (!isMountedRef.current) {
-        console.log('Component unmounted after blob received');
-        return;
-      }
-
-      // 清理旧的 blob URL
-      if (videoUrlRef.current) {
-        URL.revokeObjectURL(videoUrlRef.current);
-      }
-
-      const blobUrl = URL.createObjectURL(blob);
-      videoUrlRef.current = blobUrl;
-      setVideoUrl(blobUrl);
-
-      // 设置视频源，但不自动播放
+      // 直接使用流式 URL，不等待整个文件下载
       if (videoRef.current && isMountedRef.current) {
         videoRef.current.pause();
-        videoRef.current.src = blobUrl;
         
-        // 添加更多事件监听器
-        videoRef.current.addEventListener('loadstart', () => {
+        // 清理旧的 URL
+        if (videoUrlRef.current && videoUrlRef.current.startsWith('blob:')) {
+          URL.revokeObjectURL(videoUrlRef.current);
+        }
+        
+        // 直接设置流式 URL
+        videoRef.current.src = url;
+        videoUrlRef.current = url;
+        setVideoUrl(url);
+        
+        // 添加事件监听器
+        const handleLoadStart = () => {
           console.log('Video loadstart event');
-        });
+        };
         
-        videoRef.current.addEventListener('loadedmetadata', () => {
+        const handleLoadedMetadata = () => {
           console.log('Video metadata loaded:', {
             duration: videoRef.current.duration,
             videoWidth: videoRef.current.videoWidth,
             videoHeight: videoRef.current.videoHeight
           });
-        });
+          setLoading(false); // 元数据加载完成就可以停止加载动画
+        };
         
-        videoRef.current.addEventListener('canplay', () => {
+        const handleCanPlay = () => {
           console.log('Video can play');
-        });
+          setLoading(false);
+        };
         
-        videoRef.current.addEventListener('canplaythrough', () => {
+        const handleCanPlayThrough = () => {
           console.log('Video can play through');
-        });
+        };
         
+        const handleError = (e) => {
+          console.error('Video error:', e);
+          const error = videoRef.current.error;
+          if (error) {
+            console.error('Video error code:', error.code);
+            console.error('Video error message:', error.message);
+            
+            // 根据错误代码提供更具体的错误信息
+            let errorMessage = '视频播放错误';
+            switch (error.code) {
+              case 1:
+                errorMessage = '视频加载被中断';
+                break;
+              case 2:
+                errorMessage = '网络错误';
+                break;
+              case 3:
+                errorMessage = '视频解码错误';
+                break;
+              case 4:
+                errorMessage = '视频格式不支持';
+                break;
+              default:
+                errorMessage = '未知视频错误';
+                break;
+            }
+            setError(errorMessage);
+            setLoading(false);
+          }
+        };
+        
+        const handleProgress = () => {
+          if (videoRef.current && videoRef.current.buffered.length > 0) {
+            const buffered = videoRef.current.buffered.end(0);
+            console.log('Video buffered:', buffered, 'seconds');
+          }
+        };
+        
+        // 移除旧的事件监听器
+        Object.entries(eventListenersRef.current).forEach(([event, handler]) => {
+          if (handler) {
+            videoRef.current.removeEventListener(event, handler);
+          }
+        });
+        eventListenersRef.current = {};
+        
+                 // 添加新的事件监听器
+         eventListenersRef.current = {
+           loadstart: handleLoadStart,
+           loadedmetadata: handleLoadedMetadata,
+           canplay: handleCanPlay,
+           canplaythrough: handleCanPlayThrough,
+           error: handleError,
+           progress: handleProgress
+         };
+         
+         Object.entries(eventListenersRef.current).forEach(([event, handler]) => {
+           videoRef.current.addEventListener(event, handler);
+         });
+         
+         // 设置视频属性
+        videoRef.current.preload = 'metadata'; // 只预加载元数据
+        videoRef.current.crossOrigin = 'anonymous';
+        
+        // 加载视频
         videoRef.current.load();
-        console.log('Video loaded, ready to play');
+        console.log('Video loading started with streaming URL');
       }
 
       if (isMountedRef.current) {
         setError(null);
+        requestInProgressRef.current = false;
       }
     } catch (err) {
       if (!isMountedRef.current) return;
-      if (err.name === 'AbortError') {
-        console.log('Request was aborted');
-        return;
-      }
       console.error('Video loading error:', err);
       setError(err.message);
       setVideoUrl(null);
       setIsPlaying(false);
-    } finally {
-      if (isMountedRef.current) {
-        setLoading(false);
-        requestInProgressRef.current = false;
-      }
+      setLoading(false);
+      requestInProgressRef.current = false;
     }
   }, [cleanup]);
 
@@ -269,7 +375,7 @@ const VideoPlayer = () => {
     }, 500);
 
     return () => clearTimeout(timeoutId);
-  }, [currentTime.format('YYYY-MM-DD HH:mm'), playbackRate, camera?.video_dir]);
+  }, [currentTime.format('YYYY-MM-DD HH:mm'), playbackRate, camera?.video_dir, loadNewVideo]);
 
   // 处理视频事件
   const handleVideoError = useCallback((e) => {
@@ -309,20 +415,59 @@ const VideoPlayer = () => {
     setCurrentTime(newTime);
   }, [currentTime]);
 
-  // 处理时间轴变化
-  const handleTimelineChange = useCallback((event, newValue) => {
+  // 添加临时时间状态用于拖拽过程中的显示
+  const [tempCurrentTime, setTempCurrentTime] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // 处理时间轴拖拽过程中的变化（只更新显示，不加载视频）
+  const handleTimelineChange = useCallback((event, value) => {
+    if (!camera?.video_dir) return;
+    
+    // 将百分比转换为当天的具体时间
     const startOfDay = currentTime.startOf('day');
-    const seconds = Math.floor((newValue / 100) * 86400);
-    const newTime = startOfDay.add(seconds, 'second');
+    const secondsInDay = (value / 100) * 86400; // 86400秒 = 24小时
+    const newTime = startOfDay.add(secondsInDay, 'second');
+    
+    // 只在拖拽过程中更新临时时间，不加载视频
+    setTempCurrentTime(newTime);
+    setIsDragging(true);
+  }, [camera?.video_dir, currentTime]);
+
+  // 处理时间轴拖拽结束（实际加载视频）
+  const handleTimelineChangeCommitted = useCallback((event, value) => {
+    if (!camera?.video_dir) return;
+    
+    // 将百分比转换为当天的具体时间
+    const startOfDay = currentTime.startOf('day');
+    const secondsInDay = (value / 100) * 86400; // 86400秒 = 24小时
+    const newTime = startOfDay.add(secondsInDay, 'second');
+    
+    // 更新实际时间并加载视频
     setCurrentTime(newTime);
-  }, [currentTime]);
+    setTempCurrentTime(null);
+    setIsDragging(false);
+    setIsPlaying(false);
+    
+    // 清理当前视频
+    cleanup();
+    
+    // 加载新视频
+    const startTime = newTime.format('YYYY-MM-DD HH:mm:ss');
+    console.log('Timeline change committed - New time:', startTime);
+    
+    const url = `${config.API_BASE_URL}/api/video/stream?start_time=${encodeURIComponent(startTime)}&video_dir=${encodeURIComponent(camera.video_dir)}&playback_rate=${playbackRate}`;
+    console.log('Timeline change committed - Generated URL:', url);
+    
+    loadVideo(url);
+  }, [camera?.video_dir, playbackRate, loadVideo, cleanup, currentTime]);
 
   // 计算时间轴位置
   const calculateTimelinePosition = useCallback(() => {
-    const startOfDay = currentTime.startOf('day');
-    const seconds = currentTime.diff(startOfDay, 'second');
+    const timeToUse = tempCurrentTime || currentTime;
+    const startOfDay = timeToUse.startOf('day');
+    const seconds = timeToUse.diff(startOfDay, 'second');
     return (seconds / 86400) * 100;
-  }, [currentTime]);
+  }, [currentTime, tempCurrentTime]);
 
   // 如果没有camera对象，显示错误并返回
   if (!camera?.video_dir) {
@@ -362,10 +507,9 @@ const VideoPlayer = () => {
           onLoadStart={handleVideoLoadStart}
           onCanPlay={handleVideoCanPlay}
           onWaiting={() => setLoading(true)}
-          autoPlay
           playsInline
           crossOrigin="anonymous"
-          preload="auto"
+          preload="metadata"
         />
         {loading && (
           <Box sx={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2 }}>
@@ -385,7 +529,7 @@ const VideoPlayer = () => {
           {isPlaying ? <Pause /> : <PlayArrow />}
         </IconButton>
         <Typography variant="body1">
-          {currentTime.format('YYYY-MM-DD HH:mm:ss')}
+          {(tempCurrentTime || currentTime).format('YYYY-MM-DD HH:mm:ss')}
         </Typography>
         <FormControl size="small" sx={{ minWidth: 120 }}>
           <Select
@@ -410,7 +554,7 @@ const VideoPlayer = () => {
           <NavigateBefore />
         </IconButton>
         <Typography variant="h6" sx={{ minWidth: 200, textAlign: 'center' }}>
-          {currentTime.format('YYYY-MM-DD HH:mm:ss')}
+          {(tempCurrentTime || currentTime).format('YYYY-MM-DD HH:mm:ss')}
         </Typography>
         <IconButton onClick={() => handleDateNavigation('day', 'next')}>
           <NavigateNext />
@@ -425,6 +569,7 @@ const VideoPlayer = () => {
         <Slider
           value={calculateTimelinePosition()}
           onChange={handleTimelineChange}
+          onChangeCommitted={handleTimelineChangeCommitted}
           disabled={loading || !!error}
           sx={{
             '& .MuiSlider-thumb': {

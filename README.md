@@ -11,6 +11,7 @@
 - 🎛️ **播放控制**: 支持多种播放速度（0.5x, 1x, 2x, 4x）
 - 📱 **响应式设计**: 基于 Material-UI 的现代化用户界面
 - 🔍 **智能文件匹配**: 根据时间自动匹配对应的视频文件
+- 🐳 **容器化部署**: 支持 Docker 一键部署
 
 ## 系统架构
 
@@ -38,12 +39,13 @@
 ## 技术栈
 
 ### 后端
-- **Python 3.8+**
+- **Python 3.11**
 - **Flask**: Web 框架
 - **Flask-CORS**: 跨域资源共享
 - **webdav3**: WebDAV 客户端库
 - **requests**: HTTP 请求库
 - **FFmpeg**: 视频处理和转码
+- **Gunicorn**: WSGI 服务器
 
 ### 前端
 - **React 18**: 用户界面框架
@@ -53,14 +55,115 @@
 
 ## 安装部署
 
-### 环境要求
+### 方式一：Docker 容器部署（推荐）
 
-- Python 3.8 或更高版本
+#### 环境要求
+- Docker 20.10+
+- Docker Compose 2.0+
+
+#### 快速部署
+
+1. **克隆项目**
+```bash
+git clone <repository-url>
+cd xiaomi_cctv_nas
+```
+
+2. **配置摄像头信息**
+
+编辑 `backend/cfg.json` 文件，配置你的摄像头信息：
+```json
+{
+    "cameras": [
+        {
+            "id": 1,
+            "name": "客卧",
+            "video_dir": "/CCTV/XiaomiCamera_00_78DF72F2BD91",
+            "cam_model": "1"
+        },
+        {
+            "id": 2,
+            "name": "客厅沙发侧",
+            "video_dir": "/CCTV/XiaomiCamera_01_78DF72F2F3CE",
+            "cam_model": "1"
+        }
+    ]
+}
+```
+
+3. **配置 WebDAV 连接**
+
+编辑 `backend/webdav_client.py` 文件，修改 WebDAV 连接信息：
+```python
+class WebDAVClient:
+    def __init__(self, 
+                 server_url: str = "https://your-nas-server.com:5008",
+                 username: str = "your-username",
+                 password: str = "your-password"):
+```
+
+4. **启动服务**
+```bash
+# 构建并启动所有服务
+docker-compose up -d
+
+# 查看服务状态
+docker-compose ps
+
+# 查看日志
+docker-compose logs -f
+```
+
+5. **访问应用**
+- 前端界面: http://localhost:3000
+- 后端 API: http://localhost:5001
+
+#### 容器管理命令
+
+```bash
+# 停止服务
+docker-compose down
+
+# 重新构建镜像（代码更新后）
+docker-compose build --no-cache
+
+# 重启特定服务
+docker-compose restart backend
+
+# 查看实时日志
+docker-compose logs -f backend
+
+# 进入容器调试
+docker-compose exec backend bash
+```
+
+#### 环境变量配置
+
+可以通过环境变量自定义配置，编辑 `docker-compose.yml`：
+
+```yaml
+services:
+  backend:
+    environment:
+      - FLASK_APP=backend/app.py
+      - FLASK_ENV=production
+      - SECRET_KEY=your-secret-key-here
+      - VIDEO_DIR=videos
+      - WEBDAV_SERVER=https://your-nas-server.com:5008
+      - WEBDAV_USERNAME=your-username
+      - WEBDAV_PASSWORD=your-password
+```
+
+### 方式二：本地开发部署
+
+#### 环境要求
+
+- Python 3.11 或更高版本
 - Node.js 16 或更高版本
 - FFmpeg（用于视频处理）
 - 支持 WebDAV 的 NAS 设备
 
-### 后端安装
+#### 后端安装
 
 1. **克隆项目**
 ```bash
@@ -97,19 +200,26 @@ sudo apt install ffmpeg
 
 5. **配置设置**
 
-编辑 `backend/app.py` 中的配置：
+编辑 `backend/cfg.json` 中的摄像头配置：
+```json
+{
+    "cameras": [
+        {
+            "id": 1,
+            "name": "主卧",
+            "video_dir": "/CCTV/XiaomiCamera_00_78DF72F2BD91",
+            "cam_model": "1"
+        }
+    ]
+}
+```
+
+编辑 `backend/webdav_client.py` 中的 WebDAV 配置：
 ```python
 # WebDAV 服务器配置
 WEBDAV_SERVER = "https://your-nas-server.com:5008"
 WEBDAV_USERNAME = "your-username"
 WEBDAV_PASSWORD = "your-password"
-
-# 摄像头名称映射
-CAM_NAMES = {
-    'XiaomiCamera_00_78DF72F2BD91': '主卧',
-    'XiaomiCamera_01_78DF72F2F3CE': '客厅',
-    # 添加更多摄像头...
-}
 ```
 
 6. **启动后端服务**
@@ -119,7 +229,7 @@ python app.py
 
 后端服务将在 `http://localhost:5001` 启动。
 
-### 前端安装
+#### 前端安装
 
 1. **进入前端目录**
 ```bash
@@ -151,15 +261,16 @@ npm start
 
 ### 视频文件命名规范
 
-系统要求视频文件按以下格式命名：
-```
-00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
-```
+系统支持两种视频文件命名格式：
+
+1. **带前缀格式**: `00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4`
+2. **无前缀格式**: `YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4`
 
 例如：
 - `00_20250613133147_20250613133705.mp4`
   - 开始时间：2025年6月13日 13:31:47
   - 结束时间：2025年6月13日 13:37:05
+- `20250613133147_20250613133705.mp4`（无前缀格式）
 
 ### 目录结构
 
@@ -201,6 +312,11 @@ GET /api/video/stream?start_time=YYYY-MM-DD HH:mm:ss&video_dir=/CCTV/CameraName&
 - `video_dir`: 摄像头目录路径
 - `playback_rate`: 播放速率（0.5, 1, 2, 4）
 
+### 停止视频流
+```http
+POST /api/video/stop
+```
+
 ## 配置说明
 
 ### WebDAV 配置
@@ -222,13 +338,19 @@ class WebDAVClient:
 ```python
 cmd = [
     'ffmpeg',
+    '-timeout', '30000000',  # 30秒连接超时（微秒）
     '-headers', 'User-Agent: FFmpeg',
     '-i', webdav_url,
     '-c:v', 'libx264',      # 视频编码器
-    '-c:a', 'aac',          # 音频编码器
     '-preset', 'ultrafast', # 编码速度预设
-    '-crf', '23',           # 质量参数
-    # ... 其他参数
+    '-tune', 'zerolatency', # 零延迟调优
+    '-c:a', 'aac',          # 音频编码器
+    '-b:a', '128k',         # 音频比特率
+    '-f', 'mp4',            # 输出格式
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',  # 流式传输优化
+    '-frag_duration', '1000000',  # 1秒片段
+    '-min_frag_duration', '1000000',  # 最小片段时长
+    'pipe:1'
 ]
 ```
 
@@ -236,22 +358,51 @@ cmd = [
 
 ### 常见问题
 
-1. **视频无法播放**
-   - 检查 FFmpeg 是否正确安装
+1. **容器启动失败**
+   ```bash
+   # 查看详细错误信息
+   docker-compose logs backend
+   
+   # 检查配置文件格式
+   docker-compose exec backend cat /app/backend/cfg.json
+   ```
+
+2. **视频无法播放**
+   - 检查 FFmpeg 是否正确安装（容器中已包含）
    - 确认 WebDAV 连接配置正确
    - 检查视频文件命名格式
+   - 查看后端日志：`docker-compose logs -f backend`
 
-2. **时间跳转不准确**
+3. **时间跳转不准确**
    - 确认视频文件名中的时间戳正确
    - 检查系统时间是否同步
+   - 验证文件名格式是否支持
 
-3. **连接超时**
+4. **连接超时**
    - 检查网络连接
    - 调整 WebDAV 超时设置
    - 确认 NAS 服务正常运行
 
+5. **JSON 解析错误**
+   - 检查 `cfg.json` 文件格式是否正确
+   - 确保 JSON 语法无误
+   - 验证文件编码为 UTF-8
+
 ### 日志调试
 
+#### 容器环境
+```bash
+# 查看后端日志
+docker-compose logs -f backend
+
+# 查看前端日志
+docker-compose logs -f frontend
+
+# 进入容器调试
+docker-compose exec backend bash
+```
+
+#### 本地环境
 启用详细日志：
 ```python
 import logging
@@ -263,12 +414,31 @@ logging.basicConfig(level=logging.DEBUG)
 cmd.extend(['-loglevel', 'info'])
 ```
 
+### 性能监控
+
+```bash
+# 查看容器资源使用情况
+docker stats
+
+# 查看容器进程
+docker-compose exec backend ps aux
+
+# 检查磁盘空间
+docker-compose exec backend df -h
+```
+
 ## 性能优化
+
+### 容器优化
+- 使用多阶段构建减少镜像大小
+- 配置适当的资源限制
+- 使用数据卷持久化配置
 
 ### 后端优化
 - 使用连接池管理 WebDAV 连接
 - 实现视频文件缓存机制
 - 优化 FFmpeg 参数以平衡质量和性能
+- 配置 Gunicorn 工作进程数
 
 ### 前端优化
 - 实现视频预加载
@@ -281,6 +451,8 @@ cmd.extend(['-loglevel', 'info'])
 - 实现用户认证和授权
 - 限制 API 访问频率
 - 定期更新依赖包
+- 使用环境变量管理敏感信息
+- 配置适当的容器安全策略
 
 ## 开发计划
 
@@ -290,6 +462,8 @@ cmd.extend(['-loglevel', 'info'])
 - [ ] 添加移动端适配
 - [ ] 支持实时监控流
 - [ ] 添加视频分析功能
+- [ ] 支持多语言界面
+- [ ] 添加视频录制功能
 
 ## 贡献指南
 

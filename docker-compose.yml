@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xiaomi-cctv-backend
+    ports:
+      - "5001:5001"
+    environment:
+      - FLASK_APP=backend/app.py
+      - FLASK_ENV=production
+      - SECRET_KEY=your-secret-key-here
+      - VIDEO_DIR=videos
+    volumes:
+      - ./backend:/app/backend
+      - ./videos:/app/videos
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: xiaomi-cctv-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:5001
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+networks:
+  cctv-network:
+    driver: bridge 

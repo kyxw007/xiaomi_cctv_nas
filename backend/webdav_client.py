@@ -12,41 +12,29 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class WebDAVClient:
-    def __init__(self, 
-                 server_url: str = "https://home.kyxw007.wang:5008",
-                 username: Optional[str] = None,
-                 password: Optional[str] = None):
-        """
-        初始化 WebDAV 客户端
-        
-        Args:
-            server_url: WebDAV 服务器地址
-            username: 用户名
-            password: 密码
-        """
-        self.server_url = server_url.rstrip('/')  # 移除末尾的斜杠
-        self.username = username
-        self.password = password
-        self.auth = HTTPBasicAuth(username, password) if username and password else None
+    def __init__(self, username="kyxw007", password="nb061617"):
+        self.server_url = "https://home.kyxw007.wang:5008"
+        self.auth = (username, password)
+        self.verify_ssl = False  # 忽略SSL证书验证
         self.client = None
         self._connect()
 
     def _connect(self):
         """建立 WebDAV 连接"""
-        if not self.username or not self.password:
+        if not self.auth[0] or not self.auth[1]:
             raise ValueError("Username and password are required for authentication")
 
         options = {
             'webdav_hostname': self.server_url,
             'webdav_timeout': 30,
-            'webdav_login': self.username,
-            'webdav_password': self.password,
+            'webdav_login': self.auth[0],
+            'webdav_password': self.auth[1],
             'webdav_root': '/',  # 设置根路径
             'webdav_verbose': True,  # 启用详细日志
         }
         
         logger.debug(f"Connecting to WebDAV server: {self.server_url}")
-        logger.debug(f"Using username: {self.username}")
+        logger.debug(f"Using username: {self.auth[0]}")
         
         try:
             self.client = Client(options)
@@ -92,7 +80,7 @@ class WebDAVClient:
         </propfind>'''
         
         try:
-            response = requests.request('PROPFIND', url, auth=self.auth, headers=headers, data=body, verify=False)
+            response = requests.request('PROPFIND', url, auth=self.auth, headers=headers, data=body, verify=self.verify_ssl)
             response.raise_for_status()
             
             # 解析 XML 响应
@@ -193,7 +181,7 @@ class WebDAVClient:
             response = requests.get(
                 f"{self.server_url}{path}",
                 auth=self.auth,
-                verify=False  # 忽略SSL证书验证
+                verify=self.verify_ssl  # 使用指定的SSL验证
             )
             
             if response.status_code == 200:
@@ -220,7 +208,7 @@ class WebDAVClient:
             with requests.get(
                 f"{self.server_url}{path}",
                 auth=self.auth,
-                verify=False,  # 忽略SSL证书验证
+                verify=self.verify_ssl,  # 使用指定的SSL验证
                 stream=True    # 启用流式传输
             ) as response:
                 if response.status_code == 200:
@@ -238,10 +226,7 @@ class WebDAVClient:
 # 使用示例
 if __name__ == "__main__":
     # 创建客户端实例
-    client = WebDAVClient(
-        username="kyxw007",
-        password="nb061617"
-    )
+    client = WebDAVClient()
     
     # 列出根目录下的所有文件和文件夹
     try:

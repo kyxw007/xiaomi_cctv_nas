@@ -1,7 +1,7 @@
-from flask import Flask, jsonify, Response, request, send_file, stream_with_context
+from flask import Flask, jsonify, Response, request, send_file, stream_with_context, g
 from flask_cors import CORS
 import os
-from webdav_client import WebDAVClient
+from .webdav_client import WebDAVClient
 from datetime import datetime, timedelta
 import time
 import io
@@ -14,6 +14,9 @@ import logging
 import re
 import subprocess
 import shutil
+import signal
+import threading
+
 
 app = Flask(__name__)
 
@@ -34,66 +37,58 @@ CORS(app,
 # 配置
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev')
 app.config['VIDEO_DIR'] = os.getenv('VIDEO_DIR', 'videos')
+cameras = []
+with open('/app/backend/cfg.json', 'r', encoding='utf-8') as file:
+    data = json.load(file)
+    cameras = data['cameras']
+ 
 
-# 模拟摄像头数据，实际应用中应该从数据库或配置文件中读取
-CAMERAS = [
-    {
-        'id': 1,
-        'name': '前门摄像头',
-        'video_dir': 'videos/front_door'
-    },
-    {
-        'id': 2,
-        'name': '后门摄像头',
-        'video_dir': 'videos/back_door'
-    },
-    {
-        'id': 3,
-        'name': '车库摄像头',
-        'video_dir': 'videos/garage'
-    }
-]
+# 全局变量来跟踪活动的流进程
+active_streams = {}
+stream_lock = threading.Lock()
 
-CAM_NAMES = {
-'XiaomiCamera_00_78DF72F2BD91':'客卧',
-'XiaomiCamera_01_78DF72F2F3CE':'机位 2',
-'XiaomiCamera_02_78DF72F2EDA4':'机位 3',
-'XiaomiCamera_00_78DF72F2F3CE':'客厅沙发机位',
-'XiaomiCamera_00_78DF72F2EDA4':'客厅窗帘机位'
-}
+# 简化的停止标志
+stop_flags = {}
+stop_lock = threading.Lock()
+
+def should_stop_stream(stream_id):
+    """检查流是否应该停止"""
+    with stop_lock:
+        return stop_flags.get(stream_id, False)
+
+def set_stop_flag(stream_id):
+    """设置停止标志"""
+    with stop_lock:
+        stop_flags[stream_id] = True
+
+def clear_stop_flag(stream_id):
+    """清除停止标志"""
+    with stop_lock:
+        if stream_id in stop_flags:
+            del stop_flags[stream_id]
+
+def check_client_connection():
+    """检查客户端连接是否还活跃"""
+    try:
+        # 尝试访问请求上下文
+        if hasattr(g, 'connection_id'):
+            connection_id = g.connection_id
+            with connection_lock:
+                return client_connections.get(connection_id, False)
+        return True
+    except:
+        return False
 
 @app.route('/api/cameras', methods=['GET'])
 def get_cameras():
     """获取摄像头列表"""
-    print("get_cameras")
-    client = WebDAVClient(
-        username="kyxw007",
-        password="nb061617"
-    )
-    cameras = []
-    try:
-        files = client.list_directory("/CCTV/")
-        print(files)
-        if not files:
-            return jsonify({}), 404
-        else:
-            for item in files:
-                if item['type'] == 'directory' and item['name'].startswith("XiaomiCamera_"):
-                    cameras.append({
-                        'id': len(cameras) + 1,
-                        'name': CAM_NAMES[item['name']],
-                        'video_dir': f"/CCTV/{item['name']}"
-                    })
-
-        return jsonify({'cameras': cameras})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'cameras': cameras})
 
 @app.route('/api/cameras/<int:camera_id>/videos', methods=['GET'])
 def get_camera_videos(camera_id):
     """获取指定摄像头的视频列表"""
     try:
-        camera = next((cam for cam in CAMERAS if cam['id'] == camera_id), None)
+        camera = next((cam for cam in cameras if cam['id'] == camera_id), None)
         if not camera:
             return jsonify({'error': 'Camera not found'}), 404
 
@@ -158,19 +153,34 @@ def parse_video_filename(filename):
     """解析视频文件名，提取开始和结束时间
     
     Args:
-        filename: 视频文件名（格式：00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4）
+        filename: 视频文件名（格式：00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 或 YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4）
     
     Returns:
         (start_time, end_time) 元组，如果解析失败返回 None
     """
     try:
-        # 移除可能的00_前缀
-        name = filename.split('_', 1)[-1]
-        # 分割开始和结束时间
-        start_str, end_str = name.split('_')
+        # 分割文件名
+        parts = filename.split('_')
+        
+        # 支持两种格式：
+        # 1. 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 (3个部分)
+        # 2. YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 (2个部分)
+        if len(parts) == 3:
+            # 格式1: 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
+            start_str = parts[1]
+            end_str = parts[2].split('.')[0]  # 移除 .mp4 后缀
+        elif len(parts) == 2:
+            # 格式2: YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
+            start_str = parts[0]
+            end_str = parts[1].split('.')[0]  # 移除 .mp4 后缀
+        else:
+            # 不支持的格式
+            print(f"Unsupported filename format: {filename}")
+            return None
+            
         # 解析时间字符串
         start_time = datetime.strptime(start_str, "%Y%m%d%H%M%S")
-        end_time = datetime.strptime(end_str.split('.')[0], "%Y%m%d%H%M%S")
+        end_time = datetime.strptime(end_str, "%Y%m%d%H%M%S")
         return start_time, end_time
     except Exception as e:
         print(f"Error parsing video filename {filename}: {str(e)}")
@@ -208,22 +218,32 @@ def find_video_chunk(target_time, video_dir):
         matching_files = []
         closest_file = None
         min_time_diff = float('inf')
-        
+    
         for file in files:
             file_name = file['name']
             if not file_name.endswith('.mp4'):
                 continue
                 
-            # 从文件名中提取时间戳 (格式: 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4)
+            # 从文件名中提取时间戳 (格式: 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 或 YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4)
             parts = file_name.split('_')
-            if len(parts) != 3:
+            
+            # 支持两种格式：
+            # 1. 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 (3个部分)
+            # 2. YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 (2个部分)
+            if len(parts) == 3:
+                # 格式1: 00_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
+                start_time_str = parts[1]
+                end_time_str = parts[2].split('.')[0]  # 移除 .mp4 后缀
+            elif len(parts) == 2:
+                # 格式2: YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
+                start_time_str = parts[0]
+                end_time_str = parts[1].split('.')[0]  # 移除 .mp4 后缀
+            else:
+                # 不支持的格式，跳过
                 continue
                 
             try:
-                # 提取开始和结束时间
-                start_time_str = parts[1]
-                end_time_str = parts[2].split('.')[0]  # 移除 .mp4 后缀
-                
+                # 解析时间字符串
                 start_time = datetime.strptime(start_time_str, "%Y%m%d%H%M%S")
                 end_time = datetime.strptime(end_time_str, "%Y%m%d%H%M%S")
                 
@@ -281,19 +301,30 @@ def find_video_chunk(target_time, video_dir):
         logging.error(f"Error finding video chunk: {str(e)}")
         return None, None
 
-@app.route('/api/video/stream')
+@app.route('/api/video/stream', methods=['GET', 'OPTIONS'])
 def stream_video():
+    # 处理 OPTIONS 预检请求
+    if request.method == 'OPTIONS':
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Range,Accept,Origin,Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
     try:
         start_time = request.args.get('start_time')
         video_dir = request.args.get('video_dir')
         playback_rate = float(request.args.get('playback_rate', 1))
         
         if not start_time or not video_dir:
+            logging.error("Missing required parameters")
             return jsonify({'error': 'MISSING_PARAMS', 'message': '缺少必要参数'}), 400
             
         # 查找视频文件
         video_path, video_info = find_video_chunk(start_time, video_dir)
         if not video_path or not video_info:
+            logging.error(f"No video found for time {start_time} in directory {video_dir}")
             return jsonify({'error': 'NO_VIDEO', 'message': '该时段无视频记录'}), 404
             
         # 计算视频内的偏移时间
@@ -306,55 +337,31 @@ def stream_video():
         
         def generate_video_stream():
             process = None
+            stream_id = f"{video_dir.replace('/', '_')}_{id(threading.current_thread())}"
+            
             try:
                 webdav_url = f"https://kyxw007:nb061617@home.kyxw007.wang:5008{video_path}"
+                logging.info(f"WebDAV URL: {webdav_url}")
+                logging.info(f"Starting stream with ID: {stream_id}")
                 
-                # 使用更保守的策略：
-                # 1. 如果偏移小于60秒，从头开始播放
-                # 2. 如果偏移较大，使用输入端seek但减少偏移量以确保安全
-                
-                if offset_seconds < 60:
-                    # 小偏移：从头开始播放，让前端处理时间同步
-                    logging.info(f"Small offset ({offset_seconds}s), playing from start")
-                    cmd = [
-                        'ffmpeg',
-                        '-headers', 'User-Agent: FFmpeg',
-                        '-i', webdav_url,
-                        '-c:v', 'libx264',
-                        '-c:a', 'aac',
-                        '-preset', 'ultrafast',
-                        '-crf', '23',
-                        '-f', 'mp4',
-                        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                        '-avoid_negative_ts', 'make_zero',
-                        '-fflags', '+genpts',
-                        '-t', '300',  # 播放5分钟
-                        '-loglevel', 'info',
-                        'pipe:1'
-                    ]
-                else:
-                    # 大偏移：使用保守的seek策略
-                    # 向前seek到最近的可能关键帧位置（每10秒一个关键帧）
-                    safe_offset = max(0, (offset_seconds // 10) * 10 - 10)  # 向下取整到10秒边界，再减10秒
-                    logging.info(f"Large offset ({offset_seconds}s), using safe offset ({safe_offset}s)")
-                    
-                    cmd = [
-                        'ffmpeg',
-                        '-ss', str(safe_offset),  # 输入端seek到安全位置
-                        '-headers', 'User-Agent: FFmpeg',
-                        '-i', webdav_url,
-                        '-c:v', 'libx264',
-                        '-c:a', 'aac',
-                        '-preset', 'ultrafast',
-                        '-crf', '23',
-                        '-f', 'mp4',
-                        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                        '-avoid_negative_ts', 'make_zero',
-                        '-fflags', '+genpts',
-                        '-t', '300',  # 播放5分钟
-                        '-loglevel', 'info',
-                        'pipe:1'
-                    ]
+                # 优化流式播放启动时间
+                cmd = [
+                    'ffmpeg',
+                    '-timeout', '30000000',  # 30秒连接超时（微秒）
+                    '-headers', 'User-Agent: FFmpeg',
+                    '-i', webdav_url,
+                    '-c:v', 'libx264',  # 转换为 H.264 以确保浏览器兼容性
+                    '-preset', 'ultrafast',  # 最快编码速度
+                    '-tune', 'zerolatency',  # 零延迟调优
+                    '-c:a', 'aac',  # 转换为 AAC 音频
+                    '-b:a', '128k',  # 音频比特率
+                    '-f', 'mp4',  # 输出格式为 MP4
+                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',  # 优化流式传输
+                    '-frag_duration', '1000000',  # 1秒片段
+                    '-min_frag_duration', '1000000',  # 最小片段时长
+                    '-y',  # 覆盖输出文件
+                    'pipe:1'
+                ]
                 
                 logging.info(f"FFmpeg command: {' '.join(cmd)}")
                 
@@ -366,6 +373,10 @@ def stream_video():
                     bufsize=0
                 )
                 
+                # 注册活动流
+                with stream_lock:
+                    active_streams[stream_id] = process
+                
                 chunk_count = 0
                 total_bytes = 0
                 first_chunk_received = False
@@ -375,13 +386,18 @@ def stream_video():
                 import time
                 
                 start_time = time.time()
-                timeout = 10  # 10秒超时
+                timeout = 10
                 
                 try:
                     while True:
                         # 检查是否超时
                         if time.time() - start_time > timeout and not first_chunk_received:
                             logging.error("FFmpeg timeout: no data received within 10 seconds")
+                            break
+                        
+                        # 检查停止标志
+                        if should_stop_stream(stream_id):
+                            logging.info(f"Stop flag set for stream {stream_id}, stopping")
                             break
                         
                         # 使用非阻塞读取
@@ -404,7 +420,14 @@ def stream_video():
                             first_chunk_received = True
                             logging.info(f"First chunk received: {len(chunk)} bytes")
                         
-                        yield chunk
+                        try:
+                            yield chunk
+                        except GeneratorExit:
+                            logging.info("Client disconnected (GeneratorExit), stopping stream")
+                            raise
+                        except Exception as e:
+                            logging.info(f"Client disconnected (Exception: {e}), stopping stream")
+                            break
                         
                         # 每50个chunk记录一次进度
                         if chunk_count % 50 == 0:
@@ -425,27 +448,32 @@ def stream_video():
                     if not first_chunk_received:
                         logging.error("No data received from FFmpeg")
                         logging.error(f"FFmpeg stderr: {stderr_output}")
-                        # 尝试生成一个最小的有效MP4头
-                        yield generate_empty_mp4_header()
                 
                 except GeneratorExit:
                     logging.info("Client disconnected, stopping video stream")
                     if process and process.poll() is None:
+                        logging.info("Terminating FFmpeg process...")
                         process.terminate()
                         try:
-                            process.wait(timeout=5)
+                            process.wait(timeout=3)
+                            logging.info("FFmpeg process terminated gracefully")
                         except subprocess.TimeoutExpired:
+                            logging.warning("FFmpeg process didn't terminate gracefully, killing...")
                             process.kill()
+                            process.wait()
+                            logging.info("FFmpeg process killed")
                     raise
                 
                 except Exception as e:
                     logging.error(f"Error during FFmpeg streaming: {str(e)}")
                     if process and process.poll() is None:
+                        logging.info("Terminating FFmpeg process due to error...")
                         process.terminate()
                         try:
-                            process.wait(timeout=5)
+                            process.wait(timeout=3)
                         except subprocess.TimeoutExpired:
                             process.kill()
+                            process.wait()
                 
             except Exception as e:
                 logging.error(f"FFmpeg setup error: {str(e)}")
@@ -454,15 +482,37 @@ def stream_video():
                 yield b''
             
             finally:
-                # 确保进程被清理
+                # 从活动流中移除
+                with stream_lock:
+                    if stream_id in active_streams:
+                        del active_streams[stream_id]
+                
+                # 清理停止标志
+                clear_stop_flag(stream_id)
+                
+                # 确保进程被清理（异步，不阻塞）
                 if process and process.poll() is None:
-                    try:
-                        process.terminate()
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    except:
-                        pass
+                    def cleanup_process():
+                        try:
+                            logging.info(f"Cleaning up stream process: {stream_id}")
+                            process.terminate()
+                            process.wait(timeout=2)
+                            logging.info(f"Stream process {stream_id} terminated gracefully")
+                        except subprocess.TimeoutExpired:
+                            logging.warning(f"Stream process {stream_id} didn't terminate gracefully, killing...")
+                            try:
+                                process.kill()
+                                process.wait(timeout=1)
+                                logging.info(f"Stream process {stream_id} killed")
+                            except:
+                                logging.error(f"Failed to kill process {stream_id}")
+                        except Exception as e:
+                            logging.error(f"Error cleaning up process {stream_id}: {e}")
+                    
+                    # 在后台线程中清理进程
+                    cleanup_thread = threading.Thread(target=cleanup_process)
+                    cleanup_thread.daemon = True
+                    cleanup_thread.start()
         
         # 创建响应
         response = Response(
@@ -479,6 +529,7 @@ def stream_video():
         response.headers['Access-Control-Allow-Credentials'] = 'true'
         response.headers['Accept-Ranges'] = 'bytes'
         response.headers['Cache-Control'] = 'no-cache'
+        response.headers['Content-Type'] = 'video/mp4'
         
         return response
         
@@ -538,6 +589,83 @@ def generate_empty_mp4_header():
     """生成一个最小的有效MP4头，用于错误情况"""
     # 这是一个最小的MP4文件头，包含必要的box结构
     return b'\x00\x00\x00\x20ftypiso5\x00\x00\x00\x00iso5iso6mp41\x00\x00\x00\x08free'
+
+@app.route('/api/video/stop', methods=['POST'])
+def stop_video_stream():
+    """停止视频流"""
+    try:
+        # 立即返回响应，避免阻塞前端
+        response_data = {'message': 'Stop request received'}
+        
+        # 获取请求数据（如果有的话）
+        try:
+            data = request.get_json() or {}
+            stream_id = data.get('stream_id')
+        except:
+            data = {}
+            stream_id = None
+        
+        # 异步停止流，不阻塞响应
+        def stop_streams_async():
+            """异步停止流"""
+            try:
+                with stream_lock:
+                    streams_to_stop = []
+                    
+                    if stream_id and stream_id in active_streams:
+                        streams_to_stop.append((stream_id, active_streams[stream_id]))
+                        logging.info(f"Stopping specific video stream: {stream_id}")
+                    else:
+                        # 停止所有活动流
+                        streams_to_stop = list(active_streams.items())
+                        logging.info(f"Stopping all active video streams ({len(streams_to_stop)} streams)")
+                    
+                    # 设置停止标志并终止进程
+                    for sid, process in streams_to_stop:
+                        try:
+                            set_stop_flag(sid)
+                            if process and process.poll() is None:
+                                logging.info(f"Terminating stream process: {sid}")
+                                process.terminate()
+                                # 给进程一个很短的时间优雅退出
+                                try:
+                                    process.wait(timeout=0.5)
+                                    logging.info(f"Stream {sid} terminated gracefully")
+                                except subprocess.TimeoutExpired:
+                                    logging.warning(f"Stream {sid} didn't terminate quickly, killing...")
+                                    process.kill()
+                                    try:
+                                        process.wait(timeout=0.5)
+                                        logging.info(f"Stream {sid} killed")
+                                    except:
+                                        logging.error(f"Failed to kill stream {sid}")
+                        except Exception as e:
+                            logging.error(f"Error stopping stream {sid}: {e}")
+                    
+                    # 清理活动流字典
+                    if stream_id and stream_id in active_streams:
+                        del active_streams[stream_id]
+                    else:
+                        active_streams.clear()
+                        # 清理所有停止标志
+                        with stop_lock:
+                            stop_flags.clear()
+                            
+            except Exception as e:
+                logging.error(f"Error in async stop: {e}")
+        
+        # 在后台线程中执行停止操作
+        import threading
+        stop_thread = threading.Thread(target=stop_streams_async)
+        stop_thread.daemon = True
+        stop_thread.start()
+        
+        # 立即返回成功响应
+        return jsonify(response_data), 200
+                
+    except Exception as e:
+        logging.error(f"Error stopping video stream: {str(e)}")
+        return jsonify({'error': 'STOP_ERROR', 'message': '停止视频流失败'}), 500
 
 # 在应用启动时检查
 if __name__ == '__main__':

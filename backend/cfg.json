@@ -1,0 +1,34 @@
+{
+    "cameras": [
+        {
+            "id": 1,
+            "name": "客卧",
+            "video_dir": "/CCTV/XiaomiCamera_00_78DF72F2BD91",
+            "cam_model": "1"
+        },
+        {
+            "id": 2,
+            "name": "客厅沙发侧",
+            "video_dir": "/CCTV/XiaomiCamera_01_78DF72F2F3CE",
+            "cam_model": "1"
+        },
+        {
+            "id": 3,
+            "name": "客厅电视侧",
+            "video_dir": "/CCTV/XiaomiCamera_02_78DF72F2EDA4",
+            "cam_model": "1"
+        },
+        {
+            "id": 4,
+            "name": "客厅酒柜",
+            "video_dir": "/CCTV/xiaomi_camera_videos/78DF72462D16",
+            "cam_model": "2"
+        },
+        {
+            "id": 5,
+            "name": "主卧",
+            "video_dir": "/CCTV/xiaomi_camera_videos/78DF7255FBB9",
+            "cam_model": "2"
+        }
+    ]
+}
