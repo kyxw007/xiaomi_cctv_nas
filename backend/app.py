@@ -2,20 +2,44 @@ from flask import Flask, jsonify, Response, request, send_file, stream_with_cont
 from flask_cors import CORS
 import os
 from .webdav_client import WebDAVClient
-from datetime import datetime, timedelta
-import time
-import io
-import requests
-from urllib.parse import urljoin
-import gzip
-import base64
+from datetime import datetime
 import json
 import logging
-import re
 import subprocess
 import shutil
-import signal
 import threading
+
+# 配置日志格式，包含时间戳、日志级别、文件名、行号和消息
+os.environ['TZ'] = 'Asia/Shanghai'
+
+# 创建应用专用的logger
+logger = logging.getLogger('xiaomi_cctv')
+logger.setLevel(logging.INFO)
+
+# 创建控制台handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# 创建格式化器
+formatter = logging.Formatter(
+    '%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s:%(funcName)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# 设置格式化器
+console_handler.setFormatter(formatter)
+
+# 添加handler到logger
+logger.addHandler(console_handler)
+
+# 防止日志重复输出
+logger.propagate = False
+
+def get_time_with_ms():
+    """获取精确到毫秒的时间字符串"""
+    now = datetime.now()
+    return now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
 
 
 app = Flask(__name__)
@@ -108,47 +132,6 @@ def get_camera_videos(camera_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/videos', methods=['GET'])
-def get_videos():
-    """获取所有视频列表"""
-    try:
-        videos = []
-        video_dir = app.config['VIDEO_DIR']
-        if os.path.exists(video_dir):
-            for filename in os.listdir(video_dir):
-                if filename.endswith(('.mp4', '.avi', '.mkv')):
-                    videos.append({
-                        'id': len(videos) + 1,
-                        'name': filename,
-                        'path': f'/videos/{filename}',
-                        'size': os.path.getsize(os.path.join(video_dir, filename)),
-                        'created_at': os.path.getctime(os.path.join(video_dir, filename))
-                    })
-        return jsonify({'videos': videos})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/videos/<video_id>', methods=['GET'])
-def get_video(video_id):
-    """获取单个视频信息"""
-    try:
-        video_dir = app.config['VIDEO_DIR']
-        videos = []
-        for filename in os.listdir(video_dir):
-            if filename.endswith(('.mp4', '.avi', '.mkv')):
-                videos.append({
-                    'id': len(videos) + 1,
-                    'name': filename,
-                    'path': f'/videos/{filename}'
-                })
-        
-        video = next((v for v in videos if v['id'] == int(video_id)), None)
-        if video:
-            return jsonify(video)
-        return jsonify({'error': 'Video not found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 def parse_video_filename(filename):
     """解析视频文件名，提取开始和结束时间
     
@@ -211,7 +194,7 @@ def find_video_chunk(target_time, video_dir):
         # 获取视频目录下的所有文件
         files = client.list_directory(video_dir)
         if not files:
-            logging.info(f"No files found in directory: {video_dir}")
+            logger.info(f"No files found in directory: {video_dir}")
             return None, None
             
         # 查找包含目标时间的视频文件
@@ -259,9 +242,9 @@ def find_video_chunk(target_time, video_dir):
                         'end_time': end_time,
                         'filename': file_name
                     }
-                    logging.info(f"Found exact match video file: {video_path}")
-                    logging.info(f"Video time range: {start_time} - {end_time}")
-                    logging.info(f"Target time: {target_time_obj}")
+                    logger.info(f"Found exact match video file: {video_path}")
+                    logger.info(f"Video time range: {start_time} - {end_time}")
+                    logger.info(f"Target time: {target_time_obj}")
                     return video_path, video_info
                     
                 # 如果不在范围内，记录为候选文件
@@ -279,7 +262,7 @@ def find_video_chunk(target_time, video_dir):
                     }
                     
             except ValueError as e:
-                logging.warning(f"Error parsing time from filename {file_name}: {str(e)}")
+                logger.warning(f"Error parsing time from filename {file_name}: {str(e)}")
                 continue
         
         # 如果没有找到包含目标时间的文件，返回最接近的文件
@@ -290,15 +273,15 @@ def find_video_chunk(target_time, video_dir):
                 'end_time': closest_file['end_time'],
                 'filename': closest_file['name']
             }
-            logging.warning(f"No exact match found, using closest file: {video_path}")
-            logging.warning(f"Time difference: {closest_file['time_diff']} seconds")
+            logger.warning(f"No exact match found, using closest file: {video_path}")
+            logger.warning(f"Time difference: {closest_file['time_diff']} seconds")
             return video_path, video_info
         
-        logging.info(f"No matching video file found for time: {target_time_obj}")
+        logger.info(f"No matching video file found for time: {target_time_obj}")
         return None, None
         
     except Exception as e:
-        logging.error(f"Error finding video chunk: {str(e)}")
+        logger.error(f"Error finding video chunk: {str(e)}")
         return None, None
 
 @app.route('/api/video/stream', methods=['GET', 'OPTIONS'])
@@ -318,22 +301,22 @@ def stream_video():
         playback_rate = float(request.args.get('playback_rate', 1))
         
         if not start_time or not video_dir:
-            logging.error("Missing required parameters")
+            logger.error("Missing required parameters")
             return jsonify({'error': 'MISSING_PARAMS', 'message': '缺少必要参数'}), 400
             
         # 查找视频文件
         video_path, video_info = find_video_chunk(start_time, video_dir)
         if not video_path or not video_info:
-            logging.error(f"No video found for time {start_time} in directory {video_dir}")
+            logger.error(f"No video found for time {start_time} in directory {video_dir}")
             return jsonify({'error': 'NO_VIDEO', 'message': '该时段无视频记录'}), 404
             
         # 计算视频内的偏移时间
         target_time_obj = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
         offset_seconds = calculate_video_offset(video_info, target_time_obj)
         
-        logging.info(f"Streaming video: {video_path}")
-        logging.info(f"Target time: {target_time_obj}")
-        logging.info(f"Offset seconds: {offset_seconds}")
+        logger.info(f"Streaming video: {video_path}")
+        logger.info(f"Target time: {target_time_obj}")
+        logger.info(f"Offset seconds: {offset_seconds}")
         
         def generate_video_stream():
             process = None
@@ -341,8 +324,8 @@ def stream_video():
             
             try:
                 webdav_url = f"https://kyxw007:nb061617@home.kyxw007.wang:5008{video_path}"
-                logging.info(f"WebDAV URL: {webdav_url}")
-                logging.info(f"Starting stream with ID: {stream_id}")
+                logger.info(f"WebDAV URL: {webdav_url}")
+                logger.info(f"Starting stream with ID: {stream_id}")
                 
                 # 优化流式播放启动时间
                 cmd = [
@@ -363,7 +346,7 @@ def stream_video():
                     'pipe:1'
                 ]
                 
-                logging.info(f"FFmpeg command: {' '.join(cmd)}")
+                logger.info(f"FFmpeg command: {' '.join(cmd)}")
                 
                 # 启动 FFmpeg 进程
                 process = subprocess.Popen(
@@ -392,12 +375,12 @@ def stream_video():
                     while True:
                         # 检查是否超时
                         if time.time() - start_time > timeout and not first_chunk_received:
-                            logging.error("FFmpeg timeout: no data received within 10 seconds")
+                            logger.error("FFmpeg timeout: no data received within 10 seconds")
                             break
                         
                         # 检查停止标志
                         if should_stop_stream(stream_id):
-                            logging.info(f"Stop flag set for stream {stream_id}, stopping")
+                            logger.info(f"Stop flag set for stream {stream_id}, stopping")
                             break
                         
                         # 使用非阻塞读取
@@ -418,56 +401,56 @@ def stream_video():
                         
                         if not first_chunk_received:
                             first_chunk_received = True
-                            logging.info(f"First chunk received: {len(chunk)} bytes")
+                            logger.info(f"First chunk received: {len(chunk)} bytes")
                         
                         try:
                             yield chunk
                         except GeneratorExit:
-                            logging.info("Client disconnected (GeneratorExit), stopping stream")
+                            logger.info("Client disconnected (GeneratorExit), stopping stream")
                             raise
                         except Exception as e:
-                            logging.info(f"Client disconnected (Exception: {e}), stopping stream")
+                            logger.info(f"Client disconnected (Exception: {e}), stopping stream")
                             break
                         
                         # 每50个chunk记录一次进度
                         if chunk_count % 50 == 0:
-                            logging.info(f"Streamed {chunk_count} chunks, {total_bytes} bytes")
+                            logger.info(f"Streamed {chunk_count} chunks, {total_bytes} bytes")
                     
                     # 等待进程结束
                     return_code = process.wait(timeout=5)
                     stderr_output = process.stderr.read().decode('utf-8')
                     
                     if return_code != 0:
-                        logging.error(f"FFmpeg process failed with return code {return_code}")
-                        logging.error(f"FFmpeg stderr: {stderr_output}")
+                        logger.error(f"FFmpeg process failed with return code {return_code}")
+                        logger.error(f"FFmpeg stderr: {stderr_output}")
                     else:
-                        logging.info(f"FFmpeg streaming completed successfully")
-                        logging.info(f"Total: {chunk_count} chunks, {total_bytes} bytes")
+                        logger.info(f"FFmpeg streaming completed successfully")
+                        logger.info(f"Total: {chunk_count} chunks, {total_bytes} bytes")
                     
                     # 如果没有收到任何数据，记录详细错误信息
                     if not first_chunk_received:
-                        logging.error("No data received from FFmpeg")
-                        logging.error(f"FFmpeg stderr: {stderr_output}")
+                        logger.error("No data received from FFmpeg")
+                        logger.error(f"FFmpeg stderr: {stderr_output}")
                 
                 except GeneratorExit:
-                    logging.info("Client disconnected, stopping video stream")
+                    logger.info("Client disconnected, stopping video stream")
                     if process and process.poll() is None:
-                        logging.info("Terminating FFmpeg process...")
+                        logger.info("Terminating FFmpeg process...")
                         process.terminate()
                         try:
                             process.wait(timeout=3)
-                            logging.info("FFmpeg process terminated gracefully")
+                            logger.info("FFmpeg process terminated gracefully")
                         except subprocess.TimeoutExpired:
-                            logging.warning("FFmpeg process didn't terminate gracefully, killing...")
+                            logger.warning("FFmpeg process didn't terminate gracefully, killing...")
                             process.kill()
                             process.wait()
-                            logging.info("FFmpeg process killed")
+                            logger.info("FFmpeg process killed")
                     raise
                 
                 except Exception as e:
-                    logging.error(f"Error during FFmpeg streaming: {str(e)}")
+                    logger.error(f"Error during FFmpeg streaming: {str(e)}")
                     if process and process.poll() is None:
-                        logging.info("Terminating FFmpeg process due to error...")
+                        logger.info("Terminating FFmpeg process due to error...")
                         process.terminate()
                         try:
                             process.wait(timeout=3)
@@ -476,7 +459,7 @@ def stream_video():
                             process.wait()
                 
             except Exception as e:
-                logging.error(f"FFmpeg setup error: {str(e)}")
+                logger.error(f"FFmpeg setup error: {str(e)}")
                 if process and process.poll() is None:
                     process.terminate()
                 yield b''
@@ -494,20 +477,20 @@ def stream_video():
                 if process and process.poll() is None:
                     def cleanup_process():
                         try:
-                            logging.info(f"Cleaning up stream process: {stream_id}")
+                            logger.info(f"Cleaning up stream process: {stream_id}")
                             process.terminate()
                             process.wait(timeout=2)
-                            logging.info(f"Stream process {stream_id} terminated gracefully")
+                            logger.info(f"Stream process {stream_id} terminated gracefully")
                         except subprocess.TimeoutExpired:
-                            logging.warning(f"Stream process {stream_id} didn't terminate gracefully, killing...")
+                            logger.warning(f"Stream process {stream_id} didn't terminate gracefully, killing...")
                             try:
                                 process.kill()
                                 process.wait(timeout=1)
-                                logging.info(f"Stream process {stream_id} killed")
+                                logger.info(f"Stream process {stream_id} killed")
                             except:
-                                logging.error(f"Failed to kill process {stream_id}")
+                                logger.error(f"Failed to kill process {stream_id}")
                         except Exception as e:
-                            logging.error(f"Error cleaning up process {stream_id}: {e}")
+                            logger.error(f"Error cleaning up process {stream_id}: {e}")
                     
                     # 在后台线程中清理进程
                     cleanup_thread = threading.Thread(target=cleanup_process)
@@ -534,7 +517,7 @@ def stream_video():
         return response
         
     except Exception as e:
-        logging.error(f"Video streaming error: {str(e)}")
+        logger.error(f"Video streaming error: {str(e)}")
         return jsonify({'error': 'STREAM_ERROR', 'message': '视频流传输错误'}), 500
 
 def calculate_video_offset(video_info, target_time):
@@ -557,31 +540,31 @@ def calculate_video_offset(video_info, target_time):
         # 计算偏移
         offset_seconds = (target_time - video_start_time).total_seconds()
         
-        logging.info(f"Video start time: {video_start_time}")
-        logging.info(f"Video end time: {video_end_time}")
-        logging.info(f"Video duration: {video_duration} seconds")
-        logging.info(f"Target time: {target_time}")
-        logging.info(f"Calculated offset: {offset_seconds} seconds")
+        logger.info(f"Video start time: {video_start_time}")
+        logger.info(f"Video end time: {video_end_time}")
+        logger.info(f"Video duration: {video_duration} seconds")
+        logger.info(f"Target time: {target_time}")
+        logger.info(f"Calculated offset: {offset_seconds} seconds")
         
         # 确保偏移在有效范围内
         if offset_seconds < 0:
-            logging.warning(f"Target time {target_time} is before video start {video_start_time}, using offset 0")
+            logger.warning(f"Target time {target_time} is before video start {video_start_time}, using offset 0")
             return 0
         elif offset_seconds >= video_duration:
-            logging.warning(f"Target time {target_time} is after video end {video_end_time}, using max offset")
+            logger.warning(f"Target time {target_time} is after video end {video_end_time}, using max offset")
             # 返回视频结束前10秒的位置，避免超出范围
             return max(0, video_duration - 10)
         
         return offset_seconds
         
     except Exception as e:
-        logging.error(f"Error calculating video offset: {str(e)}")
+        logger.error(f"Error calculating video offset: {str(e)}")
         return 0
 
 def check_ffmpeg():
     """检查 FFmpeg 是否可用"""
     if not shutil.which('ffmpeg'):
-        logging.error("FFmpeg not found. Please install FFmpeg to enable video streaming with time offset.")
+        logger.error("FFmpeg not found. Please install FFmpeg to enable video streaming with time offset.")
         return False
     return True
 
@@ -593,10 +576,11 @@ def generate_empty_mp4_header():
 @app.route('/api/video/stop', methods=['POST'])
 def stop_video_stream():
     """停止视频流"""
+    logger.info(f"Stop video stream at {get_time_with_ms()}")
     try:
         # 立即返回响应，避免阻塞前端
         response_data = {'message': 'Stop request received'}
-        
+        logger.info(f"Get request data {get_time_with_ms()}")
         # 获取请求数据（如果有的话）
         try:
             data = request.get_json() or {}
@@ -604,43 +588,44 @@ def stop_video_stream():
         except:
             data = {}
             stream_id = None
-        
+        logger.info(f"def stop_streams_async {get_time_with_ms()}")
         # 异步停止流，不阻塞响应
         def stop_streams_async():
             """异步停止流"""
             try:
                 with stream_lock:
                     streams_to_stop = []
-                    
+                    logger.info(f"stop_streams_async {get_time_with_ms()}")
+                    logger.info(f"stream_id {stream_id}")
                     if stream_id and stream_id in active_streams:
                         streams_to_stop.append((stream_id, active_streams[stream_id]))
-                        logging.info(f"Stopping specific video stream: {stream_id}")
+                        logger.info(f"Stopping specific video stream: {stream_id}")
                     else:
                         # 停止所有活动流
                         streams_to_stop = list(active_streams.items())
-                        logging.info(f"Stopping all active video streams ({len(streams_to_stop)} streams)")
+                        logger.info(f"Stopping all active video streams ({len(streams_to_stop)} streams) {get_time_with_ms()}")
                     
                     # 设置停止标志并终止进程
                     for sid, process in streams_to_stop:
                         try:
                             set_stop_flag(sid)
                             if process and process.poll() is None:
-                                logging.info(f"Terminating stream process: {sid}")
+                                logger.info(f"Terminating stream process: {sid} {get_time_with_ms()}")
                                 process.terminate()
                                 # 给进程一个很短的时间优雅退出
                                 try:
                                     process.wait(timeout=0.5)
-                                    logging.info(f"Stream {sid} terminated gracefully")
+                                    logger.info(f"Stream {sid} terminated gracefully {get_time_with_ms()}")
                                 except subprocess.TimeoutExpired:
-                                    logging.warning(f"Stream {sid} didn't terminate quickly, killing...")
+                                    logger.warning(f"Stream {sid} didn't terminate quickly, killing... {get_time_with_ms()}")
                                     process.kill()
                                     try:
                                         process.wait(timeout=0.5)
-                                        logging.info(f"Stream {sid} killed")
+                                        logger.info(f"Stream {sid} killed {get_time_with_ms()}")
                                     except:
-                                        logging.error(f"Failed to kill stream {sid}")
+                                        logger.error(f"Failed to kill stream {sid} {get_time_with_ms()}")
                         except Exception as e:
-                            logging.error(f"Error stopping stream {sid}: {e}")
+                            logger.error(f"Error stopping stream {sid}: {e} {get_time_with_ms()}")
                     
                     # 清理活动流字典
                     if stream_id and stream_id in active_streams:
@@ -652,9 +637,10 @@ def stop_video_stream():
                             stop_flags.clear()
                             
             except Exception as e:
-                logging.error(f"Error in async stop: {e}")
+                logger.error(f"Error in async stop: {e} {get_time_with_ms()}")
         
         # 在后台线程中执行停止操作
+        logger.info(f"stop_thread {get_time_with_ms()}")
         import threading
         stop_thread = threading.Thread(target=stop_streams_async)
         stop_thread.daemon = True
@@ -664,7 +650,7 @@ def stop_video_stream():
         return jsonify(response_data), 200
                 
     except Exception as e:
-        logging.error(f"Error stopping video stream: {str(e)}")
+        logger.error(f"Error stopping video stream: {str(e)}  {get_time_with_ms()}")
         return jsonify({'error': 'STOP_ERROR', 'message': '停止视频流失败'}), 500
 
 # 在应用启动时检查

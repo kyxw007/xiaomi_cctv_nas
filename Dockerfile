@@ -4,8 +4,14 @@ FROM python:3.11-slim
 # 设置非交互式安装
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 安装 ffmpeg 和 gcc
-RUN apt-get update && apt-get install -y ffmpeg gcc && rm -rf /var/lib/apt/lists/*
+# 设置时区为上海
+ENV TZ=Asia/Shanghai
+
+# 安装 ffmpeg、gcc 和时区数据
+RUN apt-get update && apt-get install -y ffmpeg gcc tzdata && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
